@@ -1,1 +1,1 @@
-# Duolingo Streak Telegram Bot
+# Duolingo POW Telegram Bot
