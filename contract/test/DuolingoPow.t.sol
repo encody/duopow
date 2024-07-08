@@ -21,6 +21,6 @@ contract DuolingoPowTest is Test {
         // woo! earned 20 xp
         duo.reportXp(uid, 120);
 
-        assertEq(duo.balanceOf(address(1)), 20);
+        assertEq(duo.balanceOf(address(1)), 20 ether);
     }
 }

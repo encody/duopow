@@ -79,7 +79,7 @@ contract DuolingoPow is ERC20Base {
         unchecked {
             delta = _xp - users[_uid].xp;
         }
-        mintTo(users[_uid].addr, delta);
+        mintTo(users[_uid].addr, delta * 1 ether);
 
         users[_uid].xp = _xp;
     }
