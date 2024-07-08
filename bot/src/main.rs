@@ -2,8 +2,17 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
 use dptree::{case, deps};
-use ethers::{contract::abigen, core::k256::ecdsa::SigningKey, signers::Wallet, types::Address};
+use ethers::{
+    contract::abigen,
+    core::k256::ecdsa::SigningKey,
+    middleware::SignerMiddleware,
+    providers::Middleware,
+    signers::{Signer, Wallet},
+    types::{Address, U256},
+};
+use log::Level;
 use once_cell::sync::Lazy;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use teloxide::{
     dispatching::{
@@ -15,7 +24,6 @@ use teloxide::{
 };
 
 const USER_AGENT: &str = concat!("duopow-bot/", env!("CARGO_PKG_VERSION"));
-const CHAIN_ID: u64 = 167000; // Taiko mainnet
 
 abigen!(
     DuolingoPowContract,
@@ -58,6 +66,9 @@ enum Command {
 
         #[clap(short, long, env = "DUOPOW_CONTRACT")]
         contract: Address,
+
+        #[clap(short, long, env = "DUOPOW_RPC")]
+        rpc: Url,
     },
 }
 
@@ -132,8 +143,27 @@ enum BotCommand {
     Help,
     #[command(description = "register your Duolingo account")]
     Register { username: String },
+    #[command(description = "unregister your Duolingo account")]
+    Unregister { username: String },
     #[command(description = "update your XP")]
-    Update,
+    Update { username: String },
+}
+
+async fn get_user_total_xp(http: &reqwest::Client, uid: u64) -> anyhow::Result<u64> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TotalXp {
+        total_xp: u64,
+    }
+
+    Ok(http
+        .get(format!("https://www.duolingo.com/2017-06-30/users/{uid}"))
+        .query(&[("fields", "totalXp")])
+        .send()
+        .await?
+        .json::<TotalXp>()
+        .await?
+        .total_xp)
 }
 
 async fn get_user_uid_and_address(
@@ -172,6 +202,7 @@ async fn main() {
             password,
             contract,
             tg_token,
+            rpc,
         } => {
             pretty_env_logger::init();
             log::info!("Starting bot");
@@ -192,12 +223,25 @@ async fn main() {
                 .build()
                 .unwrap();
 
+            let provider =
+                ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc.as_str())
+                    .unwrap();
+
+            let chain_id = provider.get_chainid().await.unwrap().as_u64();
+
+            let duo = DuolingoPowContract::new(
+                contract,
+                Arc::new(SignerMiddleware::new(
+                    provider,
+                    wallet.with_chain_id(chain_id),
+                )),
+            );
+
             Dispatcher::builder(bot, handler())
                 .dependencies(deps![
                     Arc::new(Connections {
                         http,
-                        wallet,
-                        contract
+                        contract: duo,
                     }),
                     InMemStorage::<ChatState>::new()
                 ])
@@ -220,8 +264,9 @@ enum ChatState {
 
 struct Connections {
     http: reqwest::Client,
-    wallet: Wallet<SigningKey>,
-    contract: Address,
+    contract: DuolingoPowContract<
+        SignerMiddleware<ethers::providers::Provider<ethers::providers::Http>, Wallet<SigningKey>>,
+    >,
 }
 
 fn handler() -> UpdateHandler<anyhow::Error> {
@@ -230,10 +275,102 @@ fn handler() -> UpdateHandler<anyhow::Error> {
             teloxide::filter_command::<BotCommand, _>().branch(
                 case![ChatState::Start]
                     .branch(case![BotCommand::Help].endpoint(help))
-                    .branch(case![BotCommand::Register { username }].endpoint(register)),
+                    .branch(case![BotCommand::Register { username }].endpoint(register))
+                    .branch(case![BotCommand::Update { username }].endpoint(update))
+                    .branch(case![BotCommand::Unregister { username }].endpoint(unregister)),
             ),
         ),
     )
+}
+async fn update(
+    bot: Bot,
+    msg: Message,
+    connections: Arc<Connections>,
+    username: String,
+) -> anyhow::Result<()> {
+    let loading_msg = bot
+        .send_message(msg.chat.id, "Okay, loading your Duolingo profile...")
+        .await?;
+
+    let (uid, _address) = get_user_uid_and_address(&connections.http, &username)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+
+    let total_xp = get_user_total_xp(&connections.http, uid).await?;
+
+    bot.send_message(msg.chat.id, format!("Wow, you have {total_xp} XP!"))
+        .await?;
+    bot.delete_message(msg.chat.id, loading_msg.id).await?;
+
+    let sending_msg = bot
+        .send_message(msg.chat.id, "Minting your rewards...")
+        .await?;
+
+    let (_address_in_contract, xp_in_contract): (Address, U256) =
+        connections.contract.users(uid.into()).await?;
+
+    log::log!(Level::Info, "XP in contract: {}", xp_in_contract.as_u128());
+
+    if xp_in_contract == total_xp.into() {
+        bot.send_message(msg.chat.id, "You need to earn more XP to receive rewards.")
+            .await?;
+        bot.delete_message(msg.chat.id, sending_msg.id).await?;
+        return Ok(());
+    }
+
+    connections
+        .contract
+        .report_xp(uid.into(), total_xp.into())
+        .send()
+        .await?;
+
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "Congratulations, you received {} POD!",
+            (U256::from(total_xp) - xp_in_contract).as_u64()
+        ),
+    )
+    .await?;
+    bot.delete_message(msg.chat.id, sending_msg.id).await?;
+
+    Ok(())
+}
+
+async fn unregister(
+    bot: Bot,
+    msg: Message,
+    connections: Arc<Connections>,
+    username: String,
+) -> anyhow::Result<()> {
+    let loading_msg = bot
+        .send_message(msg.chat.id, "Okay, loading your Duolingo profile...")
+        .await?;
+
+    let (uid, _address) = get_user_uid_and_address(&connections.http, &username)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+
+    let unregistering_msg = bot
+        .send_message(msg.chat.id, "Unregistering you from the contract...")
+        .await?;
+    bot.delete_message(msg.chat.id, loading_msg.id).await?;
+
+    connections
+        .contract
+        .user_unregister(uid.into())
+        .send()
+        .await?;
+
+    bot.send_message(
+        msg.chat.id,
+        "You've been unregistered. Sorry to see you go!",
+    )
+    .await?;
+    bot.delete_message(msg.chat.id, unregistering_msg.id)
+        .await?;
+
+    Ok(())
 }
 
 async fn register(
@@ -250,10 +387,57 @@ async fn register(
         .await
         .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
-    bot.send_message(msg.chat.id, "Found you! Checking your registration...")
+    let checking_registration_msg = bot
+        .send_message(msg.chat.id, "Found you! Checking your registration...")
         .await?;
-    bot.delete_message(loading_msg.chat.id, loading_msg.id)
-        .await?;
+    bot.delete_message(msg.chat.id, loading_msg.id).await?;
+
+    let ((address_from_contract, _xp_from_contract), xp_from_duolingo) = tokio::try_join!(
+        async {
+            let r: (Address, U256) = connections.contract.users(uid.into()).await?;
+            Ok(r)
+        },
+        async { get_user_total_xp(&connections.http, uid).await },
+    )?;
+
+    if address_from_contract.is_zero() {
+        let registration_msg = bot
+            .send_message(
+                msg.chat.id,
+                format!("Registering ${address} with the contract..."),
+            )
+            .await?;
+        bot.delete_message(msg.chat.id, checking_registration_msg.id)
+            .await?;
+
+        connections
+            .contract
+            .user_register(uid.into(), address, xp_from_duolingo.into())
+            .send()
+            .await?;
+
+        bot.send_message(msg.chat.id, "Registered!").await?;
+        bot.delete_message(msg.chat.id, registration_msg.id).await?;
+    } else if address_from_contract != address {
+        let update_msg = bot
+            .send_message(msg.chat.id, "Looks like we need to update your profile...")
+            .await?;
+        bot.delete_message(msg.chat.id, checking_registration_msg.id)
+            .await?;
+
+        connections
+            .contract
+            .user_update_address(uid.into(), address)
+            .send()
+            .await?;
+
+        bot.delete_message(msg.chat.id, update_msg.id).await?;
+        bot.send_message(msg.chat.id, "Updated!").await?;
+    } else {
+        bot.send_message(msg.chat.id, "Already registered!").await?;
+        bot.delete_message(msg.chat.id, checking_registration_msg.id)
+            .await?;
+    }
 
     Ok(())
 }
