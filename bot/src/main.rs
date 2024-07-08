@@ -17,8 +17,8 @@ use ethers::{
     },
     types::Address,
 };
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, Executor};
 use teloxide::{
     dispatching::{dialogue::InMemStorage, UpdateHandler},
     prelude::*,
@@ -28,6 +28,9 @@ use tokio::sync::{Mutex, RwLock};
 
 const USER_AGENT: &str = concat!("duopow-bot/", env!("CARGO_PKG_VERSION"));
 const CHAIN_ID: u64 = 167000; // Taiko mainnet
+
+static ETH_ADDRESS: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"0x[0-9a-fA-F]{40}").unwrap());
 
 #[derive(Parser)]
 struct Args {
@@ -78,13 +81,17 @@ struct CourseResponse {
     id: String,
 }
 
-async fn get_user(client: &reqwest::Client, username: &str) -> anyhow::Result<UserResponse> {
+async fn get_user_from_duolingo_api(
+    client: impl AsRef<reqwest::Client>,
+    username: &str,
+) -> anyhow::Result<UserResponse> {
     #[derive(Deserialize)]
     struct UserRequestResponse {
         users: Vec<UserResponse>,
     }
 
     let mut response = client
+        .as_ref()
         .get("https://www.duolingo.com/2017-06-30/users")
         .query(&[("username", username)])
         .send()
@@ -109,59 +116,23 @@ enum BotCommand {
     Help,
     #[command(description = "register your Duolingo account")]
     Register { username: String },
-    #[command(description = "verify your Duolingo account")]
-    Verify,
     #[command(description = "update your XP")]
     Update,
 }
 
-async fn create_user_wallet(
-    db: &mut sqlx::SqliteConnection,
-    uid: u32,
+async fn get_user_uid_and_address(
+    client: impl AsRef<reqwest::Client>,
     username: &str,
-) -> Wallet<SigningKey> {
-    let w = ethers::signers::Wallet::new(&mut OsRng).with_chain_id(CHAIN_ID);
-    let b = w.signer().to_bytes();
-    let h = ethers::utils::hex::encode(b);
+) -> Option<(u64, Address)> {
+    let response = get_user_from_duolingo_api(client, username).await.ok()?;
 
-    sqlx::query!(
-        "insert into users (id, username, signing_key_hex, verified) values (?, ?, ?, false)",
-        uid,
-        username,
-        h
-    )
-    .execute(db)
-    .await
-    .unwrap();
+    let uid = response.id;
 
-    w
-}
+    let address_match = ETH_ADDRESS.find(&response.bio)?;
 
-async fn is_user_verified(db: &mut sqlx::SqliteConnection, uid: u32) -> bool {
-    sqlx::query!(
-        "select verified from users where id = ? and verified is true limit 1",
-        uid
-    )
-    .fetch_one(db)
-    .await
-    .is_ok()
-}
+    let address: Address = address_match.as_str().parse().ok()?;
 
-async fn load_user_wallet(db: &mut sqlx::SqliteConnection, uid: u32) -> Option<Wallet<SigningKey>> {
-    let h = sqlx::query!(
-        "select signing_key_hex from users where id = ? limit 1",
-        uid
-    )
-    .fetch_one(db)
-    .await
-    .ok()?
-    .signing_key_hex;
-
-    let k = SigningKey::from_slice(&ethers::utils::hex::decode(h).unwrap()).unwrap();
-    let addr = ethers::utils::secret_key_to_address(&k);
-    let w = Wallet::new_with_signer(k, addr, CHAIN_ID);
-
-    Some(w)
+    Some((uid, address))
 }
 
 #[tokio::main]
@@ -198,16 +169,6 @@ async fn main() {
                     .unwrap(),
             );
 
-            let mut db = sqlx::SqliteConnection::connect_with(
-                &sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename("db.sqlite")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-
-            sqlx::migrate!().run(&mut db).await.unwrap();
-
             let http = reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .build()
@@ -216,13 +177,8 @@ async fn main() {
             // Dispatcher::builder(bot, handler)
             // Update
 
-            Dispatcher::builder(bot, handler()).dependencies(deps![
-                Connections {
-                    db: Arc::new(Mutex::new(db)),
-                    http
-                },
-                InMemStorage::<()>::new()
-            ]);
+            Dispatcher::builder(bot, handler())
+                .dependencies(deps![Connections { http }, InMemStorage::<()>::new()]);
 
             todo!()
 
@@ -243,12 +199,9 @@ async fn main() {
     }
 }
 
-struct ChatState {
-    
-}
+struct ChatState {}
 
 struct Connections {
-    db: Arc<Mutex<sqlx::SqliteConnection>>,
     http: reqwest::Client,
 }
 
