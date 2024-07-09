@@ -21,6 +21,7 @@ use teloxide::{
         UpdateHandler,
     },
     prelude::*,
+    types::ParseMode,
     utils::command::BotCommands,
 };
 
@@ -249,6 +250,7 @@ async fn main() {
                     Arc::new(Connections {
                         http,
                         contract: duo,
+                        contract_address: contract
                     }),
                     InMemStorage::<ChatState>::new()
                 ])
@@ -282,6 +284,7 @@ struct Connections {
     contract: DuolingoPowContract<
         SignerMiddleware<ethers::providers::Provider<ethers::providers::Http>, Wallet<SigningKey>>,
     >,
+    contract_address: Address,
 }
 
 fn handler() -> UpdateHandler<anyhow::Error> {
@@ -315,6 +318,8 @@ async fn check(
     connections: Arc<Connections>,
     username: String,
 ) -> anyhow::Result<()> {
+    let bot = bot.parse_mode(ParseMode::Html);
+
     let loading_msg = bot
         .send_message(msg.chat.id, "Okay, loading your Duolingo profile...")
         .await?;
@@ -336,7 +341,7 @@ async fn check(
 
     if address_in_contract != address_in_profile {
         bot.send_message(msg.chat.id, format!(
-            "It looks like your address has changed. You've registered to withdraw to {}, but your Duolingo profile has {}.",
+            "It looks like your address has changed. You've registered to withdraw to <code>{}</code>, but your Duolingo profile has <code>{}</code>.",
             ethers::utils::to_checksum(&address_in_contract, None),
             ethers::utils::to_checksum(&address_in_profile, None),
         )).await?;
@@ -345,7 +350,7 @@ async fn check(
     bot.send_message(
         msg.chat.id,
         format!(
-            "Your account has registered the address {}, and you can mint {xp_to_mint} XP as POD.",
+            "Your account has registered the address <code>{}</code>, and you can mint {xp_to_mint} XP as POD.",
             ethers::utils::to_checksum(&address_in_contract, None)
         ),
     )
@@ -452,6 +457,8 @@ async fn register(
     connections: Arc<Connections>,
     username: String,
 ) -> anyhow::Result<()> {
+    let bot = bot.parse_mode(ParseMode::Html);
+
     let loading_msg = bot
         .send_message(msg.chat.id, "Okay, loading your Duolingo profile...")
         .await?;
@@ -477,7 +484,10 @@ async fn register(
         let registration_msg = bot
             .send_message(
                 msg.chat.id,
-                format!("Registering ${address} with the contract..."),
+                format!(
+                    "Registering <code>{}</code> with the contract...",
+                    ethers::utils::to_checksum(&address, None)
+                ),
             )
             .await?;
         bot.delete_message(msg.chat.id, checking_registration_msg.id)
@@ -536,6 +546,8 @@ async fn link_receive_username(
     dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
     connections: Arc<Connections>,
 ) -> anyhow::Result<()> {
+    let bot = bot.parse_mode(ParseMode::Html);
+
     if let Some(text) = msg.text() {
         let found_user = get_user_uid_and_maybe_address(&connections.http, text).await;
         if let Some((_uid, address)) = found_user {
@@ -545,7 +557,10 @@ async fn link_receive_username(
             if let Some(address) = address {
                 bot.send_message(
                     msg.chat.id,
-                    format!("It looks like your profile is already linked to {address}."),
+                    format!(
+                        "It looks like your profile is already linked to <code>{}</code>.",
+                        ethers::utils::to_checksum(&address, None)
+                    ),
                 )
                 .await?;
             }
@@ -648,9 +663,21 @@ async fn cancel(
     Ok(())
 }
 
-async fn help(bot: Bot, msg: Message) -> anyhow::Result<()> {
+async fn help(bot: Bot, msg: Message, connections: Arc<Connections>) -> anyhow::Result<()> {
     bot.send_message(msg.chat.id, BotCommand::descriptions().to_string())
         .await?;
+
+    let bot = bot.parse_mode(ParseMode::Html);
+
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "This bot talks to the contract <code>{}</code>.",
+            ethers::utils::to_checksum(&connections.contract_address, None),
+        ),
+    )
+    .await?;
+
     Ok(())
 }
 
