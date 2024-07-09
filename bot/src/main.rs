@@ -14,6 +14,7 @@ use log::Level;
 use once_cell::sync::Lazy;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use teloxide::{
     dispatching::{
         dialogue::{self, InMemStorage},
@@ -92,23 +93,6 @@ struct CourseResponse {
     id: String,
 }
 
-// async fn get_user_by_uid(http: &reqwest::Client, uid: u64) -> anyhow::Result<UserResponse> {
-//     let response = http
-//         .get(format!("https://www.duolingo.com/2017-06-30/users/{uid}"))
-//         .header("Host", "www.duolingo.com")
-//         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0")
-//         .send()
-//         .await?;
-
-//     panic!("{}", response.text().await.unwrap());
-
-//     // let user_response = response
-//     //     .json::<UserResponse>()
-//     //     .await?;
-
-//     // Ok(user_response)
-// }
-
 async fn get_user_by_username(
     http: &reqwest::Client,
     username: &str,
@@ -141,12 +125,18 @@ async fn get_user_by_username(
 enum BotCommand {
     #[command(description = "display this text again")]
     Help,
-    #[command(description = "register your Duolingo account")]
+    #[command(description = "link your Duolingo and Taiko accounts (do this first)")]
+    Link,
+    #[command(
+        description = "register your Duolingo account with the smart contract (do this second)"
+    )]
     Register { username: String },
     #[command(description = "unregister your Duolingo account")]
     Unregister { username: String },
-    #[command(description = "update your XP")]
+    #[command(description = "update your XP and mint your rewards")]
     Update { username: String },
+    #[command(description = "cancel")]
+    Cancel,
 }
 
 async fn get_user_total_xp(http: &reqwest::Client, uid: u64) -> anyhow::Result<u64> {
@@ -164,6 +154,21 @@ async fn get_user_total_xp(http: &reqwest::Client, uid: u64) -> anyhow::Result<u
         .json::<TotalXp>()
         .await?
         .total_xp)
+}
+
+async fn get_user_uid_and_maybe_address(
+    http: &reqwest::Client,
+    username: &str,
+) -> Option<(u64, Option<Address>)> {
+    let response = get_user_by_username(http, username).await.ok()?;
+
+    let uid = response.id;
+
+    let address_match = ETH_ADDRESS.find(&response.bio)?;
+
+    let address: Option<Address> = address_match.as_str().parse().ok();
+
+    Some((uid, address))
 }
 
 async fn get_user_uid_and_address(
@@ -260,6 +265,14 @@ async fn main() {
 enum ChatState {
     #[default]
     Start,
+    LinkReceiveUsername,
+    LinkReceiveAddress {
+        username: String,
+    },
+    LinkReceiveJwt {
+        username: String,
+        address: Address,
+    },
 }
 
 struct Connections {
@@ -271,15 +284,25 @@ struct Connections {
 
 fn handler() -> UpdateHandler<anyhow::Error> {
     dialogue::enter::<Update, InMemStorage<ChatState>, _, _>().branch(
-        Update::filter_message().branch(
-            teloxide::filter_command::<BotCommand, _>().branch(
-                case![ChatState::Start]
-                    .branch(case![BotCommand::Help].endpoint(help))
-                    .branch(case![BotCommand::Register { username }].endpoint(register))
-                    .branch(case![BotCommand::Update { username }].endpoint(update))
-                    .branch(case![BotCommand::Unregister { username }].endpoint(unregister)),
+        Update::filter_message()
+            .branch(
+                teloxide::filter_command::<BotCommand, _>().branch(
+                    case![ChatState::Start]
+                        .branch(case![BotCommand::Help].endpoint(help))
+                        .branch(case![BotCommand::Cancel].endpoint(cancel))
+                        .branch(case![BotCommand::Link].endpoint(begin_link))
+                        .branch(case![BotCommand::Register { username }].endpoint(register))
+                        .branch(case![BotCommand::Update { username }].endpoint(update))
+                        .branch(case![BotCommand::Unregister { username }].endpoint(unregister)),
+                ),
+            )
+            .branch(case![ChatState::LinkReceiveUsername].endpoint(link_receive_username))
+            .branch(
+                case![ChatState::LinkReceiveAddress { username }].endpoint(link_receive_address),
+            )
+            .branch(
+                case![ChatState::LinkReceiveJwt { username, address }].endpoint(link_receive_jwt),
             ),
-        ),
     )
 }
 async fn update(
@@ -442,6 +465,110 @@ async fn register(
     Ok(())
 }
 
+async fn begin_link(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
+) -> anyhow::Result<()> {
+    bot.send_message(msg.chat.id, "Let's get your Duolingo account set up.")
+        .await?;
+    bot.send_message(msg.chat.id, "First, what's your username?")
+        .await?;
+
+    dialogue.update(ChatState::LinkReceiveUsername).await?;
+
+    Ok(())
+}
+
+async fn link_receive_username(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
+    connections: Arc<Connections>,
+) -> anyhow::Result<()> {
+    if let Some(text) = msg.text() {
+        let found_user = get_user_uid_and_maybe_address(&connections.http, text).await;
+        if let Some((_uid, address)) = found_user {
+            bot.send_message(msg.chat.id, "Great to meet you!").await?;
+            bot.send_message(msg.chat.id, "Now, we need to link your profile.")
+                .await?;
+            if let Some(address) = address {
+                bot.send_message(
+                    msg.chat.id,
+                    format!("It looks like your profile is already linked to {address}."),
+                )
+                .await?;
+            }
+
+            dialogue
+                .update(ChatState::LinkReceiveAddress {
+                    username: text.to_owned(),
+                })
+                .await?;
+
+            bot.send_message(msg.chat.id, "What is your Taiko address?")
+                .await?;
+        } else {
+            bot.send_message(msg.chat.id, "User not found. Please try again.")
+                .await?;
+        }
+    } else {
+        bot.send_message(msg.chat.id, "Please send a username.")
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn link_receive_address(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
+    username: String,
+) -> anyhow::Result<()> {
+    if let Some(address) = msg.text() {
+        let address = ethers::utils::parse_checksummed(address, None);
+
+        if let Ok(address) = address {
+            dialogue
+                .update(ChatState::LinkReceiveJwt { username, address })
+                .await?;
+
+            bot.send_message(msg.chat.id, "Okay, now please send your JWT. You can find instructions for how to get it here: https://github.com/encody/duopow")
+                .await?;
+        } else {
+            bot.send_message(msg.chat.id, "Invalid address. Please try again.")
+                .await?;
+        }
+    } else {
+        bot.send_message(msg.chat.id, "Please send an address.")
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn link_receive_jwt(
+    bot: Bot,
+    msg: Message,
+    dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
+    connections: Arc<Connections>,
+    (_username, address): (String, Address),
+) -> anyhow::Result<()> {
+    if let Some(jwt) = msg.text() {
+        bot.send_message(msg.chat.id, "Got it! Linking profile...")
+            .await?;
+        bot.delete_message(msg.chat.id, msg.id).await?;
+        add_address_to_profile(&connections.http, jwt, address).await?;
+        dialogue.update(ChatState::Start).await?;
+        bot.send_message(msg.chat.id, "Profile linked!").await?;
+    } else {
+        bot.send_message(msg.chat.id, "Please send a JWT.").await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_rpc() {
     let rpc = ethers::providers::Provider::try_from("https://rpc.mainnet.taiko.xyz/").unwrap();
@@ -460,62 +587,94 @@ async fn test_rpc() {
     println!("{b:?}");
 }
 
+async fn cancel(
+    bot: Bot,
+    dialogue: Dialogue<ChatState, InMemStorage<ChatState>>,
+    msg: Message,
+) -> anyhow::Result<()> {
+    bot.send_message(msg.chat.id, "Cancelling.").await?;
+
+    dialogue.update(ChatState::Start).await?;
+    Ok(())
+}
+
 async fn help(bot: Bot, msg: Message) -> anyhow::Result<()> {
     bot.send_message(msg.chat.id, BotCommand::descriptions().to_string())
         .await?;
     Ok(())
 }
 
-// fn get_uid_from_jwt(token: &str) -> u64 {
-//     #[derive(Deserialize)]
-//     struct Sub {
-//         sub: u64,
-//     }
+async fn get_user_by_uid(
+    http: &reqwest::Client,
+    uid: u64,
+    jwt: &str,
+) -> anyhow::Result<UserResponse> {
+    let response = http
+        .get(format!("https://www.duolingo.com/2017-06-30/users/{uid}"))
+        .header("Host", "www.duolingo.com")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+        )
+        .bearer_auth(jwt)
+        .send()
+        .await?;
 
-//     let sub = serde_json::from_slice::<Sub>(
-//         &base64::prelude::BASE64_STANDARD_NO_PAD
-//             .decode(token.split('.').nth(1).unwrap())
-//             .unwrap(),
-//     )
-//     .unwrap()
-//     .sub;
+    let user_response = response.json::<UserResponse>().await?;
 
-//     sub
-// }
+    Ok(user_response)
+}
 
-// async fn add_address_to_profile(
-//     http: &reqwest::Client,
-//     jwt: &str,
-//     address: Address,
-// ) -> anyhow::Result<()> {
-//     let uid = get_uid_from_jwt(jwt);
-//     let original_bio = get_user_by_uid(http, uid).await.unwrap().bio;
-//     let new_bio = if ETH_ADDRESS.is_match(&original_bio) {
-//         ETH_ADDRESS.replace(&original_bio, address.to_string())
-//     } else {
-//         Cow::Owned(format!("{} {}", original_bio, address))
-//     };
+fn get_uid_from_jwt(token: &str) -> u64 {
+    #[derive(Deserialize)]
+    struct Sub {
+        sub: u64,
+    }
 
-//     panic!("{}", new_bio);
+    let sub = serde_json::from_slice::<Sub>(
+        &base64::Engine::decode(
+            &base64::prelude::BASE64_STANDARD_NO_PAD,
+            token.split('.').nth(1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .sub;
 
-//     // send update
-//     http.patch(format!("https://www.duolingo.com/2017-06-30/users/{uid}"))
-//         .query(&[("fields", "bio")])
-//         .bearer_auth(jwt)
-//         .header(
-//             "User-Agent",
-//             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
-//         )
-//         .header("Referer", "https://www.duolingo.com/settings/profile")
-//         .json(&json!({
-//             "bio": new_bio,
-//         }))
-//         .send()
-//         .await
-//         .unwrap();
+    sub
+}
 
-//     Ok(())
+async fn add_address_to_profile(
+    http: &reqwest::Client,
+    jwt: &str,
+    address: Address,
+) -> anyhow::Result<()> {
+    let uid = get_uid_from_jwt(jwt);
+    let original_bio = get_user_by_uid(http, uid, jwt).await.unwrap().bio;
+    let address_str = ethers::utils::to_checksum(&address, None);
+    let new_bio = if ETH_ADDRESS.is_match(&original_bio) {
+        ETH_ADDRESS.replace(&original_bio, address_str)
+    } else {
+        std::borrow::Cow::Owned(format!("{} {}", original_bio, address_str))
+    };
 
-//     // todo!()
+    // panic!("{}", new_bio);
 
-// }
+    // send update
+    http.patch(format!("https://www.duolingo.com/2017-06-30/users/{uid}"))
+        .query(&[("fields", "bio")])
+        .bearer_auth(jwt)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+        )
+        .header("Referer", "https://www.duolingo.com/settings/profile")
+        .json(&json!({
+            "bio": new_bio,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    Ok(())
+}
