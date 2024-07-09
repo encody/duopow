@@ -128,13 +128,15 @@ enum BotCommand {
     #[command(description = "link your Duolingo and Taiko accounts (do this first)")]
     Link,
     #[command(
-        description = "register your Duolingo account with the smart contract (do this second)"
+        description = "[username] register your Duolingo account with the smart contract (do this second)"
     )]
     Register { username: String },
-    #[command(description = "unregister your Duolingo account")]
+    #[command(description = "[username] unregister your Duolingo account")]
     Unregister { username: String },
-    #[command(description = "update your XP and mint your rewards")]
+    #[command(description = "[username] update your XP and mint your rewards")]
     Update { username: String },
+    #[command(description = "[username] view an account")]
+    Check { username: String },
     #[command(description = "cancel")]
     Cancel,
 }
@@ -293,6 +295,7 @@ fn handler() -> UpdateHandler<anyhow::Error> {
                         .branch(case![BotCommand::Link].endpoint(begin_link))
                         .branch(case![BotCommand::Register { username }].endpoint(register))
                         .branch(case![BotCommand::Update { username }].endpoint(update))
+                        .branch(case![BotCommand::Check { username }].endpoint(check))
                         .branch(case![BotCommand::Unregister { username }].endpoint(unregister)),
                 ),
             )
@@ -305,6 +308,53 @@ fn handler() -> UpdateHandler<anyhow::Error> {
             ),
     )
 }
+
+async fn check(
+    bot: Bot,
+    msg: Message,
+    connections: Arc<Connections>,
+    username: String,
+) -> anyhow::Result<()> {
+    let loading_msg = bot
+        .send_message(msg.chat.id, "Okay, loading your Duolingo profile...")
+        .await?;
+
+    let Some((uid, address_in_profile)) =
+        get_user_uid_and_address(&connections.http, &username).await
+    else {
+        bot.delete_message(msg.chat.id, loading_msg.id).await?;
+        bot.send_message(msg.chat.id, "User not found").await?;
+        return Ok(());
+    };
+
+    let total_xp = get_user_total_xp(&connections.http, uid).await?;
+
+    let (address_in_contract, xp_in_contract): (Address, U256) =
+        connections.contract.users(uid.into()).await?;
+
+    let xp_to_mint = total_xp - xp_in_contract.as_u64();
+
+    if address_in_contract != address_in_profile {
+        bot.send_message(msg.chat.id, format!(
+            "It looks like your address has changed. You've registered to withdraw to {}, but your Duolingo profile has {}.",
+            ethers::utils::to_checksum(&address_in_contract, None),
+            ethers::utils::to_checksum(&address_in_profile, None),
+        )).await?;
+    }
+
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "Your account has registered the address {}, and you can mint {xp_to_mint} XP as POD.",
+            ethers::utils::to_checksum(&address_in_contract, None)
+        ),
+    )
+    .await?;
+    bot.delete_message(msg.chat.id, loading_msg.id).await?;
+
+    Ok(())
+}
+
 async fn update(
     bot: Bot,
     msg: Message,
